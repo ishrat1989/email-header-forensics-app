@@ -1,0 +1,1091 @@
+import streamlit as st
+import re
+import ipaddress
+from email import policy
+from email.parser import BytesParser
+from reportlab.lib.pagesizes import A4
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from io import BytesIO
+
+
+# ============================================================
+# PAGE CONFIG
+# ============================================================
+
+st.set_page_config(
+    page_title="Email Header Forensics",
+    page_icon="🔎",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# ============================================================
+# CUSTOM CSS
+# ============================================================
+
+st.markdown(
+    """
+    <style>
+    .stApp {
+        background: #f5f7fb;
+    }
+
+    .hero {
+        background: linear-gradient(135deg, #0b1f3a, #123c69);
+        padding: 28px 32px;
+        border-radius: 18px;
+        color: white;
+        margin-bottom: 25px;
+        box-shadow: 0 8px 25px rgba(0,0,0,0.12);
+    }
+
+    .hero h1 {
+        margin: 0;
+        font-size: 34px;
+    }
+
+    .hero p {
+        margin-top: 8px;
+        color: #dbeafe;
+        font-size: 16px;
+    }
+
+    .section-title {
+        font-size: 22px;
+        font-weight: 700;
+        color: #102a43;
+        margin-top: 18px;
+        margin-bottom: 12px;
+    }
+
+    .metric-card {
+        background: white;
+        padding: 18px;
+        border-radius: 14px;
+        border: 1px solid #e3e8ef;
+        box-shadow: 0 3px 12px rgba(0,0,0,0.05);
+        text-align: center;
+    }
+
+    .metric-number {
+        font-size: 28px;
+        font-weight: 800;
+        color: #123c69;
+    }
+
+    .metric-label {
+        color: #64748b;
+        font-size: 13px;
+        margin-top: 4px;
+    }
+
+    .status-pass {
+        background: #ecfdf5;
+        border-left: 5px solid #10b981;
+        padding: 14px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+    }
+
+    .status-fail {
+        background: #fef2f2;
+        border-left: 5px solid #ef4444;
+        padding: 14px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+    }
+
+    .status-neutral {
+        background: #f8fafc;
+        border-left: 5px solid #64748b;
+        padding: 14px;
+        border-radius: 8px;
+        margin-bottom: 10px;
+    }
+
+    .indicator-warning {
+        background: #fff7ed;
+        border-left: 5px solid #f97316;
+        padding: 14px;
+        border-radius: 8px;
+        margin-bottom: 8px;
+    }
+
+    .indicator-danger {
+        background: #fef2f2;
+        border-left: 5px solid #dc2626;
+        padding: 14px;
+        border-radius: 8px;
+        margin-bottom: 8px;
+    }
+
+    .indicator-info {
+        background: #eff6ff;
+        border-left: 5px solid #3b82f6;
+        padding: 14px;
+        border-radius: 8px;
+        margin-bottom: 8px;
+    }
+
+    .small-note {
+        color: #64748b;
+        font-size: 13px;
+    }
+
+    div[data-testid="stFileUploader"] {
+        background: white;
+        border-radius: 12px;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    """
+    <div class="hero">
+        <h1>🔎 Email Header Forensics & Analysis</h1>
+        <p>
+            Digital-forensics tool for examining email routing,
+            IP addresses, mail servers, authentication results,
+            and potential forensic indicators.
+        </p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
+with st.sidebar:
+    st.markdown("## 🛡️ Forensic Modules")
+
+    st.markdown("**01** · Basic Information")
+    st.markdown("**02** · Received Headers")
+    st.markdown("**03** · IP Analysis")
+    st.markdown("**04** · Mail Servers")
+    st.markdown("**05** · SPF / DKIM / DMARC")
+    st.markdown("**06** · Forensic Indicators")
+    st.markdown("**07** · Investigation Summary")
+    st.markdown("**08** · PDF Evidence Report")
+
+    st.divider()
+
+    st.markdown("### ⚠️ Important")
+    st.caption(
+        "This tool provides forensic indicators and "
+        "does not independently prove sender identity, "
+        "malicious activity, or attribution."
+    )
+
+
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def extract_ips(text):
+    """Extract IPv4 and IPv6 addresses from text."""
+    candidates = re.findall(
+        r"(?<![A-Za-z0-9])"
+        r"(?:"
+        r"(?:\d{1,3}\.){3}\d{1,3}"
+        r"|"
+        r"[0-9A-Fa-f]{1,4}(?::[0-9A-Fa-f]{1,4}){2,7}"
+        r")"
+        r"(?![A-Za-z0-9])",
+        text,
+    )
+
+    valid = []
+
+    for candidate in candidates:
+        try:
+            ipaddress.ip_address(candidate)
+            if candidate not in valid:
+                valid.append(candidate)
+        except ValueError:
+            pass
+
+    return valid
+
+
+def classify_ip(ip):
+    """Classify an IP address for forensic analysis."""
+
+    try:
+        obj = ipaddress.ip_address(ip)
+
+        # Documentation/test networks
+        documentation_ranges = [
+            ipaddress.ip_network("192.0.2.0/24"),
+            ipaddress.ip_network("198.51.100.0/24"),
+            ipaddress.ip_network("203.0.113.0/24"),
+            ipaddress.ip_network("2001:db8::/32"),
+        ]
+
+        for network in documentation_ranges:
+            if obj in network:
+                return "Documentation / Test"
+
+        if obj.is_loopback:
+            return "Loopback"
+
+        if obj.is_private:
+            return "Private"
+
+        if obj.is_link_local:
+            return "Link-local"
+
+        if obj.is_multicast:
+            return "Multicast"
+
+        if obj.is_reserved:
+            return "Reserved"
+
+        if obj.is_unspecified:
+            return "Unspecified"
+
+        return "Public"
+
+    except ValueError:
+        return "Invalid"
+
+
+def authentication_results(header_text):
+    """Extract SPF, DKIM and DMARC results."""
+
+    text = header_text.lower()
+
+    results = {
+        "SPF": "Not Found",
+        "DKIM": "Not Found",
+        "DMARC": "Not Found",
+    }
+
+    spf = re.search(r"\bspf\s*=\s*([a-zA-Z]+)", text)
+    dkim = re.search(r"\bdkim\s*=\s*([a-zA-Z]+)", text)
+    dmarc = re.search(r"\bdmarc\s*=\s*([a-zA-Z]+)", text)
+
+    if spf:
+        results["SPF"] = spf.group(1).upper()
+
+    if dkim:
+        results["DKIM"] = dkim.group(1).upper()
+
+    if dmarc:
+        results["DMARC"] = dmarc.group(1).upper()
+
+    return results
+
+
+def extract_servers(received_headers):
+    """Extract host/server names from Received headers."""
+
+    servers = []
+
+    for header in received_headers:
+        matches = re.findall(
+            r"\bfrom\s+([A-Za-z0-9._-]+)",
+            header,
+            flags=re.IGNORECASE,
+        )
+
+        for match in matches:
+            if match not in servers:
+                servers.append(match)
+
+        matches = re.findall(
+            r"\bby\s+([A-Za-z0-9._-]+)",
+            header,
+            flags=re.IGNORECASE,
+        )
+
+        for match in matches:
+            if match not in servers:
+                servers.append(match)
+
+    return servers
+
+
+def generate_indicators(
+    received_headers,
+    ips,
+    auth,
+):
+    """Generate forensic indicators."""
+
+    indicators = []
+
+    if not received_headers:
+        indicators.append(
+            (
+                "danger",
+                "No Received headers found",
+                "The header contains no Received chain, limiting routing analysis.",
+            )
+        )
+
+    if len(received_headers) > 5:
+        indicators.append(
+            (
+                "warning",
+                "Long Received chain",
+                f"{len(received_headers)} Received headers were detected.",
+            )
+        )
+
+    if not any(value != "Not Found" for value in auth.values()):
+        indicators.append(
+            (
+                "warning",
+                "Authentication results unavailable",
+                "No SPF, DKIM or DMARC result was detected.",
+            )
+        )
+
+    for method, value in auth.items():
+        if value in ["FAIL", "SOFTFAIL"]:
+            indicators.append(
+                (
+                    "danger",
+                    f"{method} authentication issue",
+                    f"{method} result is {value}.",
+                )
+            )
+
+    for ip in ips:
+        classification = classify_ip(ip)
+
+        if classification == "Documentation / Test":
+            indicators.append(
+                (
+                    "info",
+                    f"Documentation/test IP: {ip}",
+                    "This address belongs to a reserved documentation range.",
+                )
+            )
+
+        elif classification == "Private":
+            indicators.append(
+                (
+                    "info",
+                    f"Private IP detected: {ip}",
+                    "A private/internal IP address appears in the header.",
+                )
+            )
+
+    if not indicators:
+        indicators.append(
+            (
+                "info",
+                "No obvious indicators detected",
+                "No basic header-level forensic indicators were triggered.",
+            )
+        )
+
+    return indicators
+
+
+def create_pdf(data):
+    """Generate a downloadable PDF forensic report."""
+
+    buffer = BytesIO()
+
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A4,
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "ReportTitle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        fontSize=20,
+        spaceAfter=18,
+    )
+
+    heading_style = ParagraphStyle(
+        "Heading",
+        parent=styles["Heading2"],
+        fontSize=13,
+        spaceBefore=14,
+        spaceAfter=8,
+    )
+
+    body_style = ParagraphStyle(
+        "Body",
+        parent=styles["BodyText"],
+        fontSize=9,
+        leading=13,
+    )
+
+    story = []
+
+    story.append(
+        Paragraph(
+            "Email Header Forensics & Analysis Report",
+            title_style,
+        )
+    )
+
+    story.append(
+        Paragraph(
+            "Generated by Email Header Forensics and Analysis Tool",
+            body_style,
+        )
+    )
+
+    story.append(Spacer(1, 15))
+
+    story.append(Paragraph("1. Basic Information", heading_style))
+
+    basic_data = [
+        ["Field", "Value"],
+        ["From", data["from"]],
+        ["To", data["to"]],
+        ["Subject", data["subject"]],
+        ["Date", data["date"]],
+        ["Message-ID", data["message_id"]],
+    ]
+
+    table = Table(basic_data, colWidths=[120, 380])
+
+    table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#123c69")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                ("FONTNAME", (0, 1), (0, -1), "Helvetica-Bold"),
+            ]
+        )
+    )
+
+    story.append(table)
+
+    story.append(
+        Paragraph(
+            "2. Received Header Analysis",
+            heading_style,
+        )
+    )
+
+    story.append(
+        Paragraph(
+            f"Received headers detected: {len(data['received'])}",
+            body_style,
+        )
+    )
+
+    for index, received in enumerate(data["received"], 1):
+        clean = received.replace("\n", " ")
+        story.append(
+            Paragraph(
+                f"{index}. {clean}",
+                body_style,
+            )
+        )
+
+    story.append(
+        Paragraph(
+            "3. IP Address Analysis",
+            heading_style,
+        )
+    )
+
+    ip_data = [["IP Address", "Classification"]]
+
+    for ip in data["ips"]:
+        ip_data.append([ip, classify_ip(ip)])
+
+    if len(ip_data) == 1:
+        ip_data.append(["None detected", "-"])
+
+    ip_table = Table(ip_data, colWidths=[220, 280])
+
+    ip_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#123c69")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+    )
+
+    story.append(ip_table)
+
+    story.append(
+        Paragraph(
+            "4. Authentication Results",
+            heading_style,
+        )
+    )
+
+    auth_data = [["Method", "Result"]]
+
+    for method, result in data["auth"].items():
+        auth_data.append([method, result])
+
+    auth_table = Table(auth_data, colWidths=[220, 280])
+
+    auth_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#123c69")),
+                ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ]
+        )
+    )
+
+    story.append(auth_table)
+
+    story.append(
+        Paragraph(
+            "5. Forensic Indicators",
+            heading_style,
+        )
+    )
+
+    for severity, title, description in data["indicators"]:
+        story.append(
+            Paragraph(
+                f"<b>{title}</b> — {description}",
+                body_style,
+            )
+        )
+
+    story.append(
+        Paragraph(
+            "6. Investigation Summary",
+            heading_style,
+        )
+    )
+
+    story.append(
+        Paragraph(
+            data["summary"],
+            body_style,
+        )
+    )
+
+    story.append(Spacer(1, 20))
+
+    story.append(
+        Paragraph(
+            "Forensic Note: Results are indicators only and should be "
+            "correlated with additional evidence before drawing conclusions.",
+            body_style,
+        )
+    )
+
+    doc.build(story)
+
+    buffer.seek(0)
+
+    return buffer
+
+
+# ============================================================
+# INPUT SECTION
+# ============================================================
+
+st.markdown(
+    '<div class="section-title">📧 Email Header Input</div>',
+    unsafe_allow_html=True,
+)
+
+uploaded_file = st.file_uploader(
+    "Upload a raw email/header file",
+    type=["eml", "txt"],
+    help="Supported formats: .eml and .txt",
+)
+
+raw_headers = ""
+
+if uploaded_file is not None:
+    raw_bytes = uploaded_file.read()
+
+    try:
+        raw_headers = raw_bytes.decode("utf-8", errors="replace")
+    except Exception:
+        raw_headers = str(raw_bytes)
+
+    st.success(f"Loaded: {uploaded_file.name}")
+
+else:
+    raw_headers = st.text_area(
+        "Or paste the raw email header below:",
+        height=280,
+        placeholder=(
+            "Paste raw email headers here...\n\n"
+            "Example:\n"
+            "From: alice@example.com\n"
+            "To: bob@example.com\n"
+            "Subject: Test Email\n"
+            "Received: from mail.example.com (192.168.1.10)\n"
+            "Authentication-Results: example.com; spf=pass; dkim=pass; dmarc=pass"
+        ),
+    )
+
+
+analyze = st.button(
+    "🔎 Analyze Email",
+    type="primary",
+    use_container_width=False,
+)
+
+
+# ============================================================
+# ANALYSIS
+# ============================================================
+
+if analyze:
+
+    if not raw_headers.strip():
+        st.error("Please upload or paste an email header first.")
+        st.stop()
+
+    # Parse email
+    try:
+        message = BytesParser(policy=policy.default).parsebytes(
+            raw_headers.encode("utf-8", errors="replace")
+        )
+    except Exception:
+        message = None
+
+    if message:
+        from_value = str(message.get("From", "Not Found"))
+        to_value = str(message.get("To", "Not Found"))
+        subject = str(message.get("Subject", "Not Found"))
+        date_value = str(message.get("Date", "Not Found"))
+        message_id = str(message.get("Message-ID", "Not Found"))
+        received_headers = message.get_all("Received", [])
+    else:
+        from_value = "Not Found"
+        to_value = "Not Found"
+        subject = "Not Found"
+        date_value = "Not Found"
+        message_id = "Not Found"
+        received_headers = []
+
+    ips = extract_ips(raw_headers)
+    auth = authentication_results(raw_headers)
+    servers = extract_servers(received_headers)
+
+    indicators = generate_indicators(
+        received_headers,
+        ips,
+        auth,
+    )
+
+    # Summary
+    summary_parts = []
+
+    summary_parts.append(
+        f"The header contains {len(received_headers)} Received header(s) "
+        f"and {len(ips)} unique IP address(es)."
+    )
+
+    if servers:
+        summary_parts.append(
+            "Mail-server references were detected in the routing chain."
+        )
+
+    if any(value in ["FAIL", "SOFTFAIL"] for value in auth.values()):
+        summary_parts.append(
+            "One or more email authentication mechanisms reported a failure "
+            "or soft failure."
+        )
+
+    if not received_headers:
+        summary_parts.append(
+            "No Received header chain was available for routing analysis."
+        )
+
+    summary_parts.append(
+        "These results should be treated as forensic indicators rather "
+        "than standalone proof of sender identity or malicious activity."
+    )
+
+    summary = " ".join(summary_parts)
+
+    data = {
+        "from": from_value,
+        "to": to_value,
+        "subject": subject,
+        "date": date_value,
+        "message_id": message_id,
+        "received": received_headers,
+        "ips": ips,
+        "servers": servers,
+        "auth": auth,
+        "indicators": indicators,
+        "summary": summary,
+    }
+
+    st.session_state["analysis"] = data
+
+
+# ============================================================
+# DISPLAY RESULTS
+# ============================================================
+
+if "analysis" in st.session_state:
+
+    data = st.session_state["analysis"]
+
+    st.divider()
+
+    st.markdown(
+        '<div class="section-title">📊 Forensic Overview</div>',
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+
+    with c1:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-number">{len(data["received"])}</div>
+                <div class="metric-label">Received Headers</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c2:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-number">{len(data["ips"])}</div>
+                <div class="metric-label">IP Addresses</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c3:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-number">{len(data["servers"])}</div>
+                <div class="metric-label">Mail Servers</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c4:
+        st.markdown(
+            f"""
+            <div class="metric-card">
+                <div class="metric-number">{len(data["indicators"])}</div>
+                <div class="metric-label">Indicators</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    # ========================================================
+    # TABS
+    # ========================================================
+
+    tabs = st.tabs(
+        [
+            "📋 Basic Information",
+            "🛣️ Received Headers",
+            "🌐 IP & Servers",
+            "🔐 Authentication",
+            "🚨 Indicators",
+            "📝 Summary",
+            "📄 PDF Report",
+        ]
+    )
+
+    # ========================================================
+    # BASIC INFORMATION
+    # ========================================================
+
+    with tabs[0]:
+
+        st.subheader("📋 Basic Email Information")
+
+        basic_info = {
+            "From": data["from"],
+            "To": data["to"],
+            "Subject": data["subject"],
+            "Date": data["date"],
+            "Message-ID": data["message_id"],
+        }
+
+        for field, value in basic_info.items():
+            st.markdown(
+                f"""
+                <div class="status-neutral">
+                    <b>{field}</b><br>
+                    {value}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # ========================================================
+    # RECEIVED HEADERS
+    # ========================================================
+
+    with tabs[1]:
+
+        st.subheader("🛣️ Received Header Chain")
+
+        if data["received"]:
+
+            st.info(
+                "Received headers represent the recorded mail-routing path. "
+                "They should be interpreted in conjunction with other evidence."
+            )
+
+            for index, received in enumerate(data["received"], 1):
+
+                st.markdown(
+                    f"**Hop {index}**"
+                )
+
+                st.code(
+                    received,
+                    language="text",
+                )
+
+        else:
+            st.warning("No Received headers were detected.")
+
+    # ========================================================
+    # IP & SERVERS
+    # ========================================================
+
+    with tabs[2]:
+
+        st.subheader("🌐 IP Address Analysis")
+
+        if data["ips"]:
+
+            for ip in data["ips"]:
+
+                classification = classify_ip(ip)
+
+                if classification == "Public":
+                    box_class = "status-pass"
+                elif classification in [
+                    "Documentation / Test",
+                    "Private",
+                ]:
+                    box_class = "status-neutral"
+                else:
+                    box_class = "status-warning"
+
+                st.markdown(
+                    f"""
+                    <div class="{box_class}">
+                        <b>{ip}</b><br>
+                        Classification: {classification}
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        else:
+            st.info("No valid IP addresses detected.")
+
+        st.subheader("🖥️ Mail Servers")
+
+        if data["servers"]:
+
+            for server in data["servers"]:
+                st.markdown(
+                    f"- `{server}`"
+                )
+
+        else:
+            st.info("No obvious mail-server names detected.")
+
+    # ========================================================
+    # AUTHENTICATION
+    # ========================================================
+
+    with tabs[3]:
+
+        st.subheader("🔐 Email Authentication")
+
+        ac1, ac2, ac3 = st.columns(3)
+
+        for column, method in zip(
+            [ac1, ac2, ac3],
+            ["SPF", "DKIM", "DMARC"],
+        ):
+
+            result = data["auth"][method]
+
+            with column:
+
+                if result == "PASS":
+                    st.markdown(
+                        f"""
+                        <div class="status-pass">
+                            <h3>✅ {method}</h3>
+                            Result: <b>{result}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                elif result in ["FAIL", "SOFTFAIL"]:
+                    st.markdown(
+                        f"""
+                        <div class="status-fail">
+                            <h3>❌ {method}</h3>
+                            Result: <b>{result}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                else:
+                    st.markdown(
+                        f"""
+                        <div class="status-neutral">
+                            <h3>⚪ {method}</h3>
+                            Result: <b>{result}</b>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+    # ========================================================
+    # INDICATORS
+    # ========================================================
+
+    with tabs[4]:
+
+        st.subheader("🚨 Forensic Indicators")
+
+        for severity, title, description in data["indicators"]:
+
+            if severity == "danger":
+                box_class = "indicator-danger"
+                icon = "🔴"
+
+            elif severity == "warning":
+                box_class = "indicator-warning"
+                icon = "🟠"
+
+            else:
+                box_class = "indicator-info"
+                icon = "🔵"
+
+            st.markdown(
+                f"""
+                <div class="{box_class}">
+                    <b>{icon} {title}</b><br>
+                    {description}
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # ========================================================
+    # SUMMARY
+    # ========================================================
+
+    with tabs[5]:
+
+        st.subheader("📝 Investigation Summary")
+
+        st.markdown(
+            f"""
+            <div class="status-neutral">
+                {data["summary"]}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        st.info(
+            "A complete forensic investigation should correlate email "
+            "headers with additional evidence such as mail-server logs, "
+            "DNS information, timestamps, endpoint data, and other "
+            "available evidence."
+        )
+
+    # ========================================================
+    # PDF
+    # ========================================================
+
+    with tabs[6]:
+
+        st.subheader("📄 Evidence Report")
+
+        st.write(
+            "Generate a structured PDF report containing the "
+            "analysis results."
+        )
+
+        pdf_file = create_pdf(data)
+
+        st.download_button(
+            label="📥 Download Forensic PDF Report",
+            data=pdf_file,
+            file_name="email_forensics_report.pdf",
+            mime="application/pdf",
+            type="primary",
+        )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.markdown(
+    """
+    <div style="text-align:center; color:#64748b; font-size:13px;">
+        🔎 Email Header Forensics & Analysis Tool
+        <br>
+        Digital Forensics & Cyber Security Project
+        <br><br>
+        Results are forensic indicators and should be correlated
+        with additional evidence.
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
