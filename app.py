@@ -645,6 +645,9 @@ else:
             "Authentication-Results: example.com; spf=pass; dkim=pass; dmarc=pass"
         ),
     )
+if raw_headers.strip():
+    evidence_hash = hashlib.sha256(raw_headers.encode("utf-8")).hexdigest()
+    st.info(f"Evidence SHA-256: {evidence_hash}")
 
 
 analyze = st.button(
