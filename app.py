@@ -646,7 +646,8 @@ else:
         ),
     )
 if raw_headers.strip():
-    evidence_hash = hashlib.sha256(raw_headers.encode("utf-8")).hexdigest()
+    evidence_hash = hashlib.sha256(raw_headers.encode("utf-8")).hexdigest() 
+    evidence_id = "EVID-" + evidence_hash[:12].upper()
     st.info(f"Evidence SHA-256: {evidence_hash}")
 
 
